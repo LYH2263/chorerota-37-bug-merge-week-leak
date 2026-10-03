@@ -41,6 +41,13 @@ def _pending_conflicts(c, task_ids):
         tuple(task_ids) + tuple(task_ids))]
 
 
+def _no_pending_conflicts(c, task_a, task_b):
+    """源任务在任意周（不只选中周）存在 pending 对调 → 拒绝合并。"""
+    conflicts = _pending_conflicts(c, [task_a, task_b])
+    if conflicts:
+        raise MergeError("pending_swap_conflict", {"swap_ids": [s["id"] for s in conflicts]})
+
+
 def _weeks(c, week_ids):
     if not week_ids:
         raise MergeError("no_weeks")
@@ -56,6 +63,7 @@ def _weeks(c, week_ids):
 def preview_merge(c, task_a, task_b, title, week_ids):
     """合并预览：只读校验 + 统计将迁格数与目标标题，不写任何表。"""
     a, b = _validate_sources(c, task_a, task_b)
+    _no_pending_conflicts(c, task_a, task_b)
     weeks = _weeks(c, week_ids)
     marks = ",".join("?" for _ in weeks)
     cells = [dict(r) for r in c.execute(
@@ -78,18 +86,15 @@ def preview_merge(c, task_a, task_b, title, week_ids):
 
 
 def apply_merge(c, task_a, task_b, title, week_ids):
-    """确认合并：清单按选中周写，落库却把两源任务全部周格迁走；pending 不拦截。"""
+    """确认合并：只迁选中周的格；库内 task_id、迁移清单、看板三路同钉。"""
     a, b = _validate_sources(c, task_a, task_b)
+    _no_pending_conflicts(c, task_a, task_b)
     weeks = _weeks(c, week_ids)
     marks = ",".join("?" for _ in weeks)
     listed = [dict(r) for r in c.execute(
         f"SELECT id, week_id, day, task_id, member_id FROM assignments "
         f"WHERE week_id IN ({marks}) AND task_id IN (?,?) ORDER BY week_id, day, id",
         tuple(w["id"] for w in weeks) + (task_a, task_b))]
-    all_cells = [dict(r) for r in c.execute(
-        "SELECT id, week_id, day, task_id, member_id FROM assignments "
-        "WHERE task_id IN (?,?) ORDER BY week_id, day, id",
-        (task_a, task_b))]
     title_s = title.strip() if title and title.strip() else f'{a["title"]}+{b["title"]}'
     new_weight = int(a["weight"] or 0) + int(b["weight"] or 0)
     cur = c.execute("INSERT INTO tasks(title,weight,data_quality) VALUES (?,?,?)",
@@ -105,7 +110,6 @@ def apply_merge(c, task_a, task_b, title, week_ids):
             "INSERT INTO task_merge_cells(merge_id,week_id,assignment_id,day,member_id,old_task_id,new_task_id,status)"
             " VALUES (?,?,?,?,?,?,?,?)",
             (merge_id, cell["week_id"], cell["id"], cell["day"], cell["member_id"], cell["task_id"], new_id, "migrated"))
-    for cell in all_cells:
         c.execute("UPDATE assignments SET task_id=? WHERE id=?", (new_id, cell["id"]))
     per_week = [{
         "week_id": w["id"], "label": w["label"],
