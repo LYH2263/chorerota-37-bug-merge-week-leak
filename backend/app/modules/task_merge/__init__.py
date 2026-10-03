@@ -53,43 +53,54 @@ def _weeks(c, week_ids):
     return out
 
 
-def preview_merge(c, task_a, task_b, title, week_ids):
-    """合并预览：只读校验 + 统计将迁格数与目标标题，不写任何表。"""
-    a, b = _validate_sources(c, task_a, task_b)
-    weeks = _weeks(c, week_ids)
+def _selected_cells(c, weeks, task_a, task_b):
+    """选中周内挂在两源任务上的格子——预览、迁移、清单共用此唯一口径。"""
     marks = ",".join("?" for _ in weeks)
-    cells = [dict(r) for r in c.execute(
+    return [dict(r) for r in c.execute(
         f"SELECT id, week_id, day, task_id, member_id FROM assignments "
         f"WHERE week_id IN ({marks}) AND task_id IN (?,?) ORDER BY week_id, day, id",
         tuple(w["id"] for w in weeks) + (task_a, task_b))]
-    per_week = [{
+
+
+def _per_week(weeks, task_a, task_b, cells):
+    return [{
         "week_id": w["id"], "label": w["label"],
         "cells": sum(1 for x in cells if x["week_id"] == w["id"]),
         "task_a_cells": sum(1 for x in cells if x["week_id"] == w["id"] and x["task_id"] == task_a),
         "task_b_cells": sum(1 for x in cells if x["week_id"] == w["id"] and x["task_id"] == task_b),
     } for w in weeks]
+
+
+def _reject_pending(c, task_ids):
+    conflicts = _pending_conflicts(c, task_ids)
+    if conflicts:
+        raise MergeError("pending_swap_conflict", {"swap_ids": [s["id"] for s in conflicts]})
+
+
+def preview_merge(c, task_a, task_b, title, week_ids):
+    """合并预览：只读校验 + 统计将迁格数与目标标题，不写任何表。"""
+    a, b = _validate_sources(c, task_a, task_b)
+    _reject_pending(c, [task_a, task_b])
+    weeks = _weeks(c, week_ids)
+    cells = _selected_cells(c, weeks, task_a, task_b)
     return {
         "target_title": title.strip() if title and title.strip() else f'{a["title"]}+{b["title"]}',
         "new_weight": int(a["weight"] or 0) + int(b["weight"] or 0),
         "would_migrate": len(cells),
-        "per_week": per_week,
+        "per_week": _per_week(weeks, task_a, task_b, cells),
         "cells": cells,
     }
 
 
 def apply_merge(c, task_a, task_b, title, week_ids):
-    """确认合并：清单按选中周写，落库却把两源任务全部周格迁走；pending 不拦截。"""
+    """确认合并：建新任务，仅迁选中周格子；迁移清单与实际迁移格严格同集合。
+
+    未选中周的旧任务格保持不动；源任务任意周存在 pending 对调则拒绝。
+    """
     a, b = _validate_sources(c, task_a, task_b)
+    _reject_pending(c, [task_a, task_b])
     weeks = _weeks(c, week_ids)
-    marks = ",".join("?" for _ in weeks)
-    listed = [dict(r) for r in c.execute(
-        f"SELECT id, week_id, day, task_id, member_id FROM assignments "
-        f"WHERE week_id IN ({marks}) AND task_id IN (?,?) ORDER BY week_id, day, id",
-        tuple(w["id"] for w in weeks) + (task_a, task_b))]
-    all_cells = [dict(r) for r in c.execute(
-        "SELECT id, week_id, day, task_id, member_id FROM assignments "
-        "WHERE task_id IN (?,?) ORDER BY week_id, day, id",
-        (task_a, task_b))]
+    listed = _selected_cells(c, weeks, task_a, task_b)
     title_s = title.strip() if title and title.strip() else f'{a["title"]}+{b["title"]}'
     new_weight = int(a["weight"] or 0) + int(b["weight"] or 0)
     cur = c.execute("INSERT INTO tasks(title,weight,data_quality) VALUES (?,?,?)",
@@ -99,27 +110,25 @@ def apply_merge(c, task_a, task_b, title, week_ids):
         "INSERT INTO task_merges(task_a_id,task_b_id,new_task_id,title,status) VALUES (?,?,?,?,?)",
         (task_a, task_b, new_id, title_s, "confirmed"))
     merge_id = cur.lastrowid
-    listed_ids = {x["id"] for x in listed}
     for cell in listed:
         c.execute(
             "INSERT INTO task_merge_cells(merge_id,week_id,assignment_id,day,member_id,old_task_id,new_task_id,status)"
             " VALUES (?,?,?,?,?,?,?,?)",
             (merge_id, cell["week_id"], cell["id"], cell["day"], cell["member_id"], cell["task_id"], new_id, "migrated"))
-    for cell in all_cells:
         c.execute("UPDATE assignments SET task_id=? WHERE id=?", (new_id, cell["id"]))
-    per_week = [{
-        "week_id": w["id"], "label": w["label"],
-        "cells": sum(1 for x in listed if x["week_id"] == w["id"]),
-        "task_a_cells": sum(1 for x in listed if x["week_id"] == w["id"] and x["task_id"] == task_a),
-        "task_b_cells": sum(1 for x in listed if x["week_id"] == w["id"] and x["task_id"] == task_b),
-    } for w in weeks]
+    listed_ids = sorted(x["id"] for x in listed)
     return {"merge_id": merge_id, "new_task_id": new_id,
             "target_title": title_s, "migrated": len(listed),
-            "per_week": per_week, "listed_ids": sorted(listed_ids)}
+            "per_week": _per_week(weeks, task_a, task_b, listed), "listed_ids": listed_ids}
 
 
 def split_merge(c, merge_id):
-    """显式拆回，全有或全无：所有已迁格仍挂在新任务上才还原，否则整体拒绝。"""
+    """显式拆回，全有或全无：看板挂新任务的格集合必须恰为清单 migrated 格集合。
+
+    - 清单内格已缺失或不再挂新任务（周被重新生成、格子被改派）→ 拒绝；
+    - 看板上存在清单外仍挂新任务的格（历史周泄漏等）→ 同样拒绝，
+      否则新任务 archived 后这些格无清单可还原，看板与清单再度脱节。
+    """
     m = c.execute("SELECT * FROM task_merges WHERE id=?", (merge_id,)).fetchone()
     if not m:
         raise MergeError("merge_missing", {"merge_id": merge_id})
@@ -132,10 +141,16 @@ def split_merge(c, merge_id):
     cells = [dict(r) for r in c.execute(
         "SELECT * FROM task_merge_cells WHERE merge_id=? AND status='migrated'", (merge_id,))]
     blocked = []
+    manifest_ids = set()
     for cell in cells:
+        manifest_ids.add(cell["assignment_id"])
         a = c.execute("SELECT task_id FROM assignments WHERE id=?", (cell["assignment_id"],)).fetchone()
         if not a or a["task_id"] != m["new_task_id"]:
             blocked.append(cell["week_id"])
+    extra = [dict(r) for r in c.execute(
+        "SELECT id, week_id FROM assignments WHERE task_id=?", (m["new_task_id"],))
+        if r["id"] not in manifest_ids]
+    blocked.extend(x["week_id"] for x in extra)
     if blocked:
         raise MergeError("cells_not_restorable", {"week_ids": sorted(set(blocked))})
     for cell in cells:
